@@ -1,6 +1,6 @@
 ﻿using System;
 
-namespace RabbitMQMultipleConsumers
+namespace RabbitMQ4Net
 {
     class Program
     {
