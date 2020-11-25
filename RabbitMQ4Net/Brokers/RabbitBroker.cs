@@ -1,8 +1,12 @@
 ﻿using Newtonsoft.Json;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace RabbitMQ4Net
 {
@@ -24,8 +28,8 @@ namespace RabbitMQ4Net
         }
         private readonly object _helpObjectLockCon = new object();
 
-        private readonly int _milisecondsToWaitReading = 0;
         private readonly Action<string, Exception> _logger;
+
         private readonly string _host;
         private readonly string _username;
         private readonly string _password;
@@ -38,7 +42,6 @@ namespace RabbitMQ4Net
             string password,
             int port,
             bool connectOnlyWhenPushing = true,
-            int milisecondsToWaitReading = 100,
             Action<string, Exception> logger = null)
         {
             _host = host;
@@ -47,7 +50,6 @@ namespace RabbitMQ4Net
             _port = port;
 
             _logger = logger ?? ((string mensagem, Exception ex) => { });
-            _milisecondsToWaitReading = milisecondsToWaitReading;
 
             if (!connectOnlyWhenPushing)
                 _privateConnection = CreateConnection();
@@ -98,6 +100,72 @@ namespace RabbitMQ4Net
                 channel.BasicPublish(string.Empty, nomeFila, null, Encoding.UTF8.GetBytes(message));
             }
             return true;
+        }
+        static SemaphoreSlim semaphoreSlim = new SemaphoreSlim(1, 1);
+
+        public void Subscribe(Func<string, Task<(ulong tag, bool success)>> taskEvent)
+        {
+            using var channel = Connection.CreateModel();
+            channel.BasicQos(0, 10, false);
+
+            var rawMessages = new List<BasicDeliverEventArgs>(100);
+            var consumer = new EventingBasicConsumer(channel);
+
+            int countBatch = 20;
+            consumer.Received += async (ch, ea) =>
+            {
+                try
+                {
+                    rawMessages.Add(ea);
+
+                    if (rawMessages.Count() == countBatch)
+                    {
+                        await semaphoreSlim.WaitAsync();
+
+                        var tasks = rawMessages.Select(item =>
+                        {
+                            try
+                            {
+                                var message = Encoding.UTF8.GetString(item.Body);
+                                return taskEvent(message);
+                            }
+                            catch (Exception)
+                            {
+                                channel.BasicNack(item.DeliveryTag, false, true);
+                                throw;
+                            }
+                        });
+
+                        var results = await Task.WhenAll(tasks);
+
+                        var failedResults = results.Where(r => !r.success);
+                        for (int i = (failedResults.Count() - 1); i >= 0; i--)
+                        {
+                            var failedResult = failedResults.ElementAt(i);
+                            channel.BasicNack(failedResult.tag, false, true);
+                        }
+
+                        channel.BasicAck(rawMessages.FirstOrDefault().DeliveryTag, true);
+
+                        rawMessages.Clear();
+
+                        semaphoreSlim.Release();
+                    }
+                }
+                catch (Exception)
+                {
+                    for (int i = (rawMessages.Count - 1); i >= 0; i--)
+                    {
+                        var rawMessage = rawMessages.ElementAt(i);
+                        channel.BasicNack(rawMessage.DeliveryTag, false, true);
+
+                        rawMessages.Remove(rawMessage);
+                    }
+                    throw;
+                }
+
+                channel.BasicConsume("", false, consumer);
+            };
         }
 
         public void Dispose()
