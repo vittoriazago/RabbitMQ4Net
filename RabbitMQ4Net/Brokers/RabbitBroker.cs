@@ -103,10 +103,14 @@ namespace RabbitMQ4Net
         }
         static SemaphoreSlim semaphoreSlim = new SemaphoreSlim(1, 1);
 
-        public void Subscribe(Func<string, Task<(ulong tag, bool success)>> taskEvent)
+        public void Subscribe(Func<string, Task<(ulong Tag, bool Success)>> taskEvent)
         {
             using var channel = Connection.CreateModel();
             channel.BasicQos(0, 10, false);
+            channel.BasicAcks += (sender, ea) =>
+            {
+                //log something
+            };
 
             var rawMessages = new List<BasicDeliverEventArgs>(100);
             var consumer = new EventingBasicConsumer(channel);
@@ -124,44 +128,32 @@ namespace RabbitMQ4Net
 
                         var tasks = rawMessages.Select(item =>
                         {
-                            try
-                            {
-                                var message = Encoding.UTF8.GetString(item.Body);
-                                return taskEvent(message);
-                            }
-                            catch (Exception)
-                            {
-                                channel.BasicNack(item.DeliveryTag, false, true);
-                                throw;
-                            }
+                            var message = Encoding.UTF8.GetString(item.Body);
+                            return taskEvent(message);
                         });
-
                         var results = await Task.WhenAll(tasks);
 
-                        var failedResults = results.Where(r => !r.success);
-                        for (int i = (failedResults.Count() - 1); i >= 0; i--)
+                        var failedResults = results.Where(r => !r.Success);
+                        for (int i = failedResults.Count() - 1; i >= 0; i--)
                         {
-                            var failedResult = failedResults.ElementAt(i);
-                            channel.BasicNack(failedResult.tag, false, true);
+                            var (Tag, Success) = failedResults.ElementAt(i);
+                            channel.BasicNack(Tag, false, true);
                         }
 
-                        channel.BasicAck(rawMessages.FirstOrDefault().DeliveryTag, true);
+                        if(results.Any(r => r.Success))
+                            channel.BasicAck(results.FirstOrDefault(r => r.Success).Tag, true);
 
                         rawMessages.Clear();
 
                         semaphoreSlim.Release();
                     }
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
-                    for (int i = (rawMessages.Count - 1); i >= 0; i--)
-                    {
-                        var rawMessage = rawMessages.ElementAt(i);
-                        channel.BasicNack(rawMessage.DeliveryTag, false, true);
+                    _logger($"Erro ao consumir mensagens, voltando mensagens para fila", ex);
+                    channel.BasicNack(rawMessages.FirstOrDefault().DeliveryTag, true, true);
 
-                        rawMessages.Remove(rawMessage);
-                    }
-                    throw;
+                    rawMessages.Clear();
                 }
 
                 channel.BasicConsume("", false, consumer);
